@@ -7,6 +7,7 @@ import tempfile
 import sys
 import site
 import subprocess
+import shutil
 import datetime
 import csv
 import re
@@ -33,6 +34,12 @@ try:
     HAS_OPENCV = True
 except ImportError:
     HAS_OPENCV = False
+
+try:
+    import imageio_ffmpeg
+    HAS_IMAGEIO_FFMPEG = True
+except ImportError:
+    HAS_IMAGEIO_FFMPEG = False
 
 
 class FareTekerlekFiltresi(QtCore.QObject):
@@ -99,7 +106,7 @@ class PatlatilmisGorunumUI(QtWidgets.QWidget):
         self.arayuzu_olustur()
         self.arayuzu_stillendir()
         FreeCAD.Console.PrintMessage(
-            f"[Patlatılmış Görünüm Pro] Arayüz başlatıldı ({len(self.objects_data)} parça yüklü).\n"
+            f"[SmartExplode] Arayüz başlatıldı ({len(self.objects_data)} parça yüklü).\n"
         )
 
     def _yukleme_penceresi_baslat(self):
@@ -107,7 +114,7 @@ class PatlatilmisGorunumUI(QtWidgets.QWidget):
             self.yukleme_penceresi = QtWidgets.QProgressDialog(
                 "⏳ Makro başlatılıyor, sahnedeki parçalar taranıyor...", None, 0, 100
             )
-            self.yukleme_penceresi.setWindowTitle("Patlatılmış Görünüm Pro - Yükleniyor")
+            self.yukleme_penceresi.setWindowTitle("SmartExplode - Yükleniyor")
             self.yukleme_penceresi.setWindowModality(QtCore.Qt.NonModal)
             self.yukleme_penceresi.setMinimumDuration(0)
             self.yukleme_penceresi.setMinimumSize(420, 105)
@@ -325,7 +332,7 @@ class PatlatilmisGorunumUI(QtWidgets.QWidget):
             if not sh or sh.isNull():
                 return FreeCAD.Vector(0, 0, 0)
 
-            if hasattr( obj, "getGlobalPlacement"):
+            if hasattr(obj, "getGlobalPlacement"):
                 g_pl = obj.getGlobalPlacement()
                 l_pl = obj.Placement
                 if (g_pl.Base - l_pl.Base).Length > 1e-4 or not g_pl.Rotation.isSame(l_pl.Rotation, 1e-4):
@@ -593,7 +600,7 @@ class PatlatilmisGorunumUI(QtWidgets.QWidget):
             d['kademe_r'] = 0 if mesafe <= tolerans else idx
 
     def arayuzu_olustur(self):
-        self.setWindowTitle("Gelişmiş Patlatılmış Görünüm ve Teknik Resim Paketi (Pro)")
+        self.setWindowTitle("SmartExplode")
         self.setWindowFlags(
             QtCore.Qt.Window |
             QtCore.Qt.WindowMinimizeButtonHint |
@@ -1192,19 +1199,24 @@ class PatlatilmisGorunumUI(QtWidgets.QWidget):
         self.spin_sinir.valueChanged.connect(self._video_ozet_guncelle)
         self._video_ozet_guncelle()
 
-        if HAS_OPENCV:
+        if HAS_OPENCV or self._ffmpeg_yolu_bul():
             self.btn_video_kayit = QtWidgets.QPushButton("🎬 Patlatma Animasyonunu MP4 Olarak Kaydet")
             self.btn_video_kayit.setObjectName("btn_video")
             self.btn_video_kayit.clicked.connect(self.video_kaydet)
             video_layout.addWidget(self.btn_video_kayit)
-            video_layout.addWidget(QtWidgets.QLabel("<small style='color:#a6e3a1;'>✓ Sistem MP4 kaydına hazır (OpenCV Aktif).</small>"))
+            video_layout.addWidget(QtWidgets.QLabel("<small style='color:#a6e3a1;'>✓ Sistem MP4 (H.264) kaydına hazır.</small>"))
+            if not self._ffmpeg_yolu_bul():
+                self.btn_kur = QtWidgets.QPushButton("⚙️ Gelişmiş H.264 Kodek Desteğini Kur (Önerilen)")
+                self.btn_kur.setObjectName("btn_kur")
+                self.btn_kur.clicked.connect(self.opencv_kur)
+                video_layout.addWidget(self.btn_kur)
         else:
             self.btn_video_kayit = QtWidgets.QPushButton("📷 Animasyonu PNG Görüntü Dizisi Olarak Kaydet")
             self.btn_video_kayit.setObjectName("btn_video_png")
             self.btn_video_kayit.clicked.connect(self.video_kaydet)
             video_layout.addWidget(self.btn_video_kayit)
 
-            self.btn_kur = QtWidgets.QPushButton("⚙️ MP4 Özelliğini Aktifleştir (OpenCV Kur)")
+            self.btn_kur = QtWidgets.QPushButton("⚙️ MP4 Özelliğini Aktifleştir (OpenCV & H.264 Kur)")
             self.btn_kur.setObjectName("btn_kur")
             self.btn_kur.clicked.connect(self.opencv_kur)
             video_layout.addWidget(self.btn_kur)
@@ -2206,9 +2218,9 @@ class PatlatilmisGorunumUI(QtWidgets.QWidget):
 
     def _patlama_orani_uygula(self, deger_float, slider_senkronla=True):
         if slider_senkronla:
-             self.slider.blockSignals(True)
-             self.slider.setValue(int(round(deger_float)))
-             self.slider.blockSignals(False)
+            self.slider.blockSignals(True)
+            self.slider.setValue(int(round(deger_float)))
+            self.slider.blockSignals(False)
 
         self.label.setText(f"Açılma Oranı: %{deger_float:.0f}\n(Slider üzerine gelin ve farenin tekerleğini kaydırın)")
         if not self.objects_data:
@@ -3733,6 +3745,39 @@ class PatlatilmisGorunumUI(QtWidgets.QWidget):
                 kure.ViewObject.Visibility = kure_eski_gorunurluk
             FreeCADGui.updateGui()
 
+    def _ffmpeg_yolu_bul(self):
+        """
+        Evrensel H.264 (yuv420p + faststart) MP4 çıktısı üretebilmek için
+        sistemdeki veya imageio_ffmpeg paketindeki FFmpeg çalıştırılabilir dosyasını bulur.
+        """
+        try:
+            if HAS_IMAGEIO_FFMPEG:
+                exe = imageio_ffmpeg.get_ffmpeg_exe()
+                if exe and os.path.exists(exe):
+                    return exe
+        except Exception:
+            pass
+
+        try:
+            import imageio_ffmpeg as _iio_ff
+            exe = _iio_ff.get_ffmpeg_exe()
+            if exe and os.path.exists(exe):
+                return exe
+        except Exception:
+            pass
+
+        sistem_ffmpeg = shutil.which("ffmpeg")
+        if sistem_ffmpeg and os.path.exists(sistem_ffmpeg):
+            return sistem_ffmpeg
+
+        freecad_bin = os.path.dirname(sys.executable)
+        for aday in ("ffmpeg.exe", "ffmpeg"):
+            aday_yol = os.path.join(freecad_bin, aday)
+            if os.path.exists(aday_yol):
+                return aday_yol
+
+        return None
+
     def opencv_kur(self):
         try:
             python_exe = os.path.join(os.path.dirname(sys.executable), "python.exe")
@@ -3743,19 +3788,19 @@ class PatlatilmisGorunumUI(QtWidgets.QWidget):
             self.btn_kur.setEnabled(False)
             FreeCADGui.updateGui()
 
-            FreeCAD.Console.PrintMessage("\n[OpenCV Kurulumu] Basladi...\n")
-            subprocess.check_call([python_exe, "-m", "pip", "install", "opencv-python", "--user"])
-            FreeCAD.Console.PrintMessage("[OpenCV Kurulumu] Basariyla Tamamlandi!\n\n")
+            FreeCAD.Console.PrintMessage("\n[Video Kodek Kurulumu] Basladi...\n")
+            subprocess.check_call([python_exe, "-m", "pip", "install", "opencv-python", "imageio-ffmpeg", "--user"])
+            FreeCAD.Console.PrintMessage("[Video Kodek Kurulumu] Basariyla Tamamlandi!\n\n")
 
             QtWidgets.QMessageBox.information(
                 self,
                 "Başarılı",
-                "OpenCV başarıyla kuruldu!\n\nMP4 özelliğini kullanabilmek için LÜTFEN FREECAD'i TAMAMEN KAPATIP YENİDEN AÇIN."
+                "OpenCV ve H.264 Video Kodek bileşenleri başarıyla kuruldu!\n\nMP4 özelliğini kullanabilmek için LÜTFEN FREECAD'i TAMAMEN KAPATIP YENİDEN AÇIN."
             )
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Hata", f"Kurulum başarısız oldu:\n{str(e)}")
             self.btn_kur.setEnabled(True)
-            self.btn_kur.setText("⚙️ MP4 Özelliğini Aktifleştir (OpenCV Kur)")
+            self.btn_kur.setText("⚙️ MP4 Özelliğini Aktifleştir (OpenCV & H.264 Kur)")
 
     def video_kaydet(self):
         global HAS_OPENCV
@@ -3776,7 +3821,9 @@ class PatlatilmisGorunumUI(QtWidgets.QWidget):
             kure_eski_gorunurluk = kure.ViewObject.Visibility
             kure.ViewObject.Visibility = False
 
-        if HAS_OPENCV:
+        ffmpeg_exe = self._ffmpeg_yolu_bul()
+
+        if HAS_OPENCV or ffmpeg_exe:
             dosya_yolu, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self, "MP4 Olarak Kaydet", "Patlatma_Animasyonu.mp4", "Video Files (*.mp4)"
             )
@@ -3784,40 +3831,126 @@ class PatlatilmisGorunumUI(QtWidgets.QWidget):
                 if kure and hasattr(kure, "ViewObject") and kure.ViewObject:
                     kure.ViewObject.Visibility = kure_eski_gorunurluk
                 return
+            if not dosya_yolu.lower().endswith(".mp4"):
+                dosya_yolu += ".mp4"
 
             FreeCAD.Console.PrintMessage(
                 f"\n[Video Kaydı] MP4 işleniyor ({gercek_sure:.1f} sn, {gercek_hiz:.1f} %/sn, {toplam_kare} kare, {fps} FPS)...\nHedef: {dosya_yolu}\n"
             )
             temp_dir = tempfile.mkdtemp()
 
-            self._patlama_orani_uygula(0.0, slider_senkronla=True)
-            FreeCADGui.updateGui()
-            test_img = os.path.join(temp_dir, "test.png")
-            FreeCADGui.ActiveDocument.ActiveView.saveImage(test_img)
+            try:
+                self._patlama_orani_uygula(0.0, slider_senkronla=True)
+                FreeCADGui.updateGui()
+                test_img = os.path.join(temp_dir, "test.png")
+                FreeCADGui.ActiveDocument.ActiveView.saveImage(test_img)
 
-            frame = cv2.imread(test_img)
-            height, width, _ = frame.shape
+                q_test = QtGui.QImage(test_img)
+                raw_w = max(2, q_test.width())
+                raw_h = max(2, q_test.height())
+                # Evrensel H.264 / YUV420p standardı için genişlik ve yükseklik 2'nin katı olmalıdır
+                even_w = raw_w - (raw_w % 2)
+                even_h = raw_h - (raw_h % 2)
 
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            video = cv2.VideoWriter(dosya_yolu, fourcc, float(fps), (width, height))
+                for idx, oran in enumerate(oran_dizisi):
+                    self._patlama_orani_uygula(oran, slider_senkronla=True)
+                    kare_yolu = os.path.join(temp_dir, f"frame_{idx:05d}.png")
+                    FreeCADGui.ActiveDocument.ActiveView.saveImage(kare_yolu)
+                    if idx % 5 == 0:
+                        QtWidgets.QApplication.processEvents()
 
-            for idx, oran in enumerate(oran_dizisi):
-                self._patlama_orani_uygula(oran, slider_senkronla=True)
-                tmp_path = os.path.join(temp_dir, "frame.png")
-                FreeCADGui.ActiveDocument.ActiveView.saveImage(tmp_path)
-                video.write(cv2.imread(tmp_path))
-                if idx % 5 == 0:
-                    QtWidgets.QApplication.processEvents()
+                video_olusturuldu = False
 
-            video.release()
-            self.konumlari_sifirla()
-            if kure and hasattr(kure, "ViewObject") and kure.ViewObject:
-                kure.ViewObject.Visibility = kure_eski_gorunurluk
-            FreeCAD.Console.PrintMessage("Video kaydi basariyla bitti!\n")
-            QtWidgets.QMessageBox.information(
-                self, "Başarılı",
-                f"MP4 Video ({gercek_sure:.1f} sn / {toplam_kare} Kare) başarıyla kaydedildi:\n\n{dosya_yolu}"
-            )
+                # 1. Öncelik: FFmpeg ile evrensel H.264 (libx264 + yuv420p + faststart) kodlama
+                if ffmpeg_exe:
+                    try:
+                        komut = [
+                            ffmpeg_exe, "-y",
+                            "-framerate", str(fps),
+                            "-i", os.path.join(temp_dir, "frame_%05d.png"),
+                            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                            "-c:v", "libx264",
+                            "-profile:v", "high",
+                            "-level", "4.0",
+                            "-pix_fmt", "yuv420p",
+                            "-movflags", "+faststart",
+                            "-crf", "22",
+                            dosya_yolu
+                        ]
+                        startupinfo = None
+                        if os.name == 'nt':
+                            startupinfo = subprocess.STARTUPINFO()
+                            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                        res = subprocess.run(
+                            komut, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo
+                        )
+                        if res.returncode == 0 and os.path.exists(dosya_yolu) and os.path.getsize(dosya_yolu) > 512:
+                            video_olusturuldu = True
+                    except Exception:
+                        video_olusturuldu = False
+
+                # 2. Yedek: OpenCV üzerinden H.264 (avc1 / H264) veya mp4v denemesi + varsa FFmpeg ile dönüştürme
+                if not video_olusturuldu and HAS_OPENCV:
+                    gecici_ham_mp4 = os.path.join(temp_dir, "raw_out.mp4")
+                    video = None
+                    secilen_kodek = None
+
+                    for kodek_adi in ('avc1', 'H264', 'h264', 'X264', 'mp4v'):
+                        try:
+                            fourcc = cv2.VideoWriter_fourcc(*kodek_adi)
+                            aday_writer = cv2.VideoWriter(gecici_ham_mp4, fourcc, float(fps), (even_w, even_h))
+                            if aday_writer is not None and aday_writer.isOpened():
+                                video = aday_writer
+                                secilen_kodek = kodek_adi
+                                break
+                        except Exception:
+                            continue
+
+                    if video is not None:
+                        for idx in range(toplam_kare):
+                            kare_yolu = os.path.join(temp_dir, f"frame_{idx:05d}.png")
+                            img = cv2.imread(kare_yolu)
+                            if img is not None:
+                                if img.shape[1] != even_w or img.shape[0] != even_h:
+                                    img = img[:even_h, :even_w]
+                                video.write(img)
+                        video.release()
+
+                        if os.path.exists(gecici_ham_mp4) and os.path.getsize(gecici_ham_mp4) > 512:
+                            # Eğer mp4v ile yazıldıysa ve FFmpeg mevcutsa evrensel H.264'e çevir
+                            if secilen_kodek == 'mp4v' and ffmpeg_exe:
+                                try:
+                                    subprocess.run([
+                                        ffmpeg_exe, "-y", "-i", gecici_ham_mp4,
+                                        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                                        "-movflags", "+faststart", dosya_yolu
+                                    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                except Exception:
+                                    shutil.copyfile(gecici_ham_mp4, dosya_yolu)
+                            else:
+                                shutil.copyfile(gecici_ham_mp4, dosya_yolu)
+                            video_olusturuldu = True
+
+                self.konumlari_sifirla()
+                if kure and hasattr(kure, "ViewObject") and kure.ViewObject:
+                    kure.ViewObject.Visibility = kure_eski_gorunurluk
+
+                if video_olusturuldu:
+                    FreeCAD.Console.PrintMessage("Video kaydi basariyla bitti!\n")
+                    QtWidgets.QMessageBox.information(
+                        self, "Başarılı",
+                        f"MP4 Video ({gercek_sure:.1f} sn / {toplam_kare} Kare) başarıyla kaydedildi:\n\n{dosya_yolu}"
+                    )
+                else:
+                    QtWidgets.QMessageBox.warning(
+                        self, "Uyarı",
+                        "MP4 dosyası oluşturulamadı. Lütfen Video sekmesindeki kodek kurulum butonuna tıklayın."
+                    )
+            finally:
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
         else:
             klasor = QtWidgets.QFileDialog.getExistingDirectory(self, "Görüntülerin Kaydedileceği Klasörü Seçin")
             if not klasor:
